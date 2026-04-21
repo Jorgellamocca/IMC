@@ -1,7 +1,5 @@
 streamlit
-streamlit-folium
-folium
-shapely
-pyogrio
-fiona
-pyproj
+numpy
+pandas
+matplotlib
+xarray

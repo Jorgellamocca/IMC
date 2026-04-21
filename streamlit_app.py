@@ -1,10 +1,8 @@
 import os
 import json
-import geopandas as gpd
 import streamlit as st
 import folium
-from branca.element import MacroElement
-from jinja2 import Template
+from shapely.geometry import shape, Point
 from streamlit_folium import st_folium
 
 # =========================================================
@@ -70,7 +68,6 @@ def parse_climate_filename(filename: str):
     if not filename.endswith(".geojson"):
         return None
 
-    # Excluir capas administrativas
     if filename.lower() in {"departamentos.geojson", "provincias.geojson", "cuencas.geojson"}:
         return None
 
@@ -170,12 +167,37 @@ def build_indexes():
 
 @st.cache_data(show_spinner=False)
 def load_geojson(path: str):
-    gdf = gpd.read_file(path)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    if gdf.crs is not None and gdf.crs.to_string() != "EPSG:4326":
-        gdf = gdf.to_crs(epsg=4326)
 
-    return json.loads(gdf.to_json())
+def get_district_field_name(geojson_data):
+    candidates = [
+        "DISTRITO", "distrito", "NOMBDIST", "nomdist",
+        "DIST_NOM", "NOMBRE_DIST", "NOMBRE", "name"
+    ]
+    features = geojson_data.get("features", [])
+    if not features:
+        return None
+
+    props = features[0].get("properties", {})
+    for c in candidates:
+        if c in props:
+            return c
+    return None
+
+
+def get_value_field_name(geojson_data):
+    candidates = ["valor", "VALOR", "indice", "INDICE", "IMC", "imc", "categoria", "CATEGORIA"]
+    features = geojson_data.get("features", [])
+    if not features:
+        return None
+
+    props = features[0].get("properties", {})
+    for c in candidates:
+        if c in props:
+            return c
+    return None
 
 
 def get_district_name(props):
@@ -251,7 +273,7 @@ def get_indice_color(raw):
 def climate_style_function(variable):
     def _style(feature):
         props = feature.get("properties", {})
-        value = props.get("valor")
+        value = get_valor_field(props)
         return {
             "fillColor": get_climate_color(value, variable),
             "color": "#666666",
@@ -280,62 +302,120 @@ def layer_style_function(feature):
     }
 
 
-def climate_popup_html(feature, variable):
-    props = feature.get("properties", {})
-    distrito = get_district_name(props)
-    val = props.get("valor")
+def parse_coordinates(lat_text, lon_text):
+    try:
+        lat = float(str(lat_text).strip().replace(",", "."))
+        lon = float(str(lon_text).strip().replace(",", "."))
+    except Exception:
+        return None, None, "Latitud o longitud no válidas."
 
-    if val is None or val == "":
-        label = "Sin dato"
-    else:
+    if not (-90 <= lat <= 90):
+        return None, None, "La latitud debe estar entre -90 y 90."
+
+    if not (-180 <= lon <= 180):
+        return None, None, "La longitud debe estar entre -180 y 180."
+
+    return lat, lon, None
+
+
+def point_query_feature(geojson_data, lat, lon):
+    pt = Point(lon, lat)
+
+    for feature in geojson_data.get("features", []):
+        geom = feature.get("geometry")
+        if not geom:
+            continue
+
         try:
-            if variable == "pr":
-                label = f"ΔP: {float(val):.1f}%"
-            else:
-                label = f"ΔT: {float(val):.1f}°C"
+            polygon = shape(geom)
+            if polygon.contains(pt) or polygon.touches(pt):
+                return feature.get("properties", {})
         except Exception:
-            label = f"{val}"
+            continue
 
-    return f"""
-    <div style="font-size:13px;">
-        <b>DISTRITO:</b> {distrito}<br>
-        <b>{label}</b>
+    return None
+
+
+def format_value_for_popup(raw, variable=None, is_indice=False):
+    if raw in [None, ""]:
+        return "Sin dato"
+
+    try:
+        val = float(raw)
+        if is_indice:
+            return f"{val:.2f}"
+        if variable == "pr":
+            return f"{val:.1f} %"
+        return f"{val:.1f} °C"
+    except Exception:
+        return str(raw)
+
+
+def build_search_popup_html(
+    lat,
+    lon,
+    climate_props=None,
+    variable=None,
+    estacion=None,
+    periodo=None,
+    indice_props=None,
+    tipo_indice=None
+):
+    rows = []
+    rows.append(("Latitud", f"{lat:.5f}"))
+    rows.append(("Longitud", f"{lon:.5f}"))
+
+    if climate_props is not None:
+        distrito = get_district_name(climate_props)
+        valor = get_valor_field(climate_props)
+
+        rows.append(("Distrito", distrito))
+        rows.append(("Visualización", "Escenario climático"))
+        rows.append(("Variable", variables_dict.get(variable, variable)))
+        rows.append(("Estación", estaciones_dict.get(estacion, estacion)))
+        rows.append(("Período", periodo))
+        rows.append(("Valor", format_value_for_popup(valor, variable=variable, is_indice=False)))
+
+    if indice_props is not None:
+        distrito_imc = get_district_name(indice_props)
+        valor_imc = get_valor_field(indice_props)
+
+        if climate_props is None:
+            rows.append(("Distrito", distrito_imc))
+
+        rows.append(("Visualización", "Índice multipeligro"))
+        rows.append(("Tipo IMC", indice_dict.get(tipo_indice, tipo_indice)))
+        rows.append(("Período IMC", periodo))
+        rows.append(("Valor IMC", format_value_for_popup(valor_imc, is_indice=True)))
+
+    if climate_props is None and indice_props is None:
+        rows.append(("Resultado", "El punto no cae dentro de un polígono con datos."))
+
+    html_rows = ""
+    for k, v in rows:
+        html_rows += f"""
+        <tr>
+            <td style="padding:6px 8px; border:1px solid #ddd; background:#f7f7f7; font-weight:bold;">{k}</td>
+            <td style="padding:6px 8px; border:1px solid #ddd;">{v}</td>
+        </tr>
+        """
+
+    html = f"""
+    <div style="width:320px; font-size:12px;">
+        <div style="font-weight:bold; margin-bottom:8px; font-size:13px;">
+            Información del punto consultado
+        </div>
+        <table style="border-collapse:collapse; width:100%;">
+            {html_rows}
+        </table>
     </div>
     """
+    return html
 
 
-def indice_popup_html(feature):
-    props = feature.get("properties", {})
-    distrito = get_district_name(props)
-    raw = get_valor_field(props)
-
-    if raw is None or raw == "":
-        imc_text = "Sin dato"
-    else:
-        try:
-            imc_text = f"{float(raw):.2f}"
-        except Exception:
-            imc_text = str(raw)
-
-    return f"""
-    <div style="font-size:13px;">
-        <b>DISTRITO:</b> {distrito}<br>
-        <b>IMC:</b> {imc_text}
-    </div>
-    """
-
-
-class FloatLegend(MacroElement):
-    def __init__(self, html):
-        super().__init__()
-        self._name = "FloatLegend"
-        self.template = Template(f"""
-        {{% macro html(this, kwargs) %}}
-        {html}
-        {{% endmacro %}}
-        """)
-
-
+# =========================================================
+# LEYENDAS
+# =========================================================
 def add_climate_legend(map_obj, variable):
     if variable == "pr":
         labels = [
@@ -359,8 +439,14 @@ def add_climate_legend(map_obj, variable):
     for c, lab in zip(colors, labels):
         items_html += f"""
         <div style="display:flex; align-items:center; margin-bottom:4px;">
-            <span style="display:inline-block; width:14px; height:12px; background:{c};
-                         border:1px solid #999; margin-right:6px;"></span>
+            <span style="
+                display:inline-block;
+                width:14px;
+                height:12px;
+                background:{c};
+                border:1px solid #999;
+                margin-right:6px;">
+            </span>
             <span style="font-size:12px;">{lab}</span>
         </div>
         """
@@ -370,20 +456,24 @@ def add_climate_legend(map_obj, variable):
         position: fixed;
         bottom: 25px;
         left: 25px;
-        z-index: 9999;
-        background: rgba(255,255,255,0.95);
+        z-index: 999999;
+        background: rgba(255,255,255,0.96);
+        border: 1px solid #999;
         border-radius: 8px;
         padding: 10px;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+        box-shadow: 0 2px 10px rgba(0,0,0,0.25);
         max-height: 280px;
         overflow-y: auto;
-        min-width: 150px;
+        min-width: 160px;
+        font-family: Arial, sans-serif;
     ">
-        <div style="font-weight:bold; margin-bottom:8px; font-size:13px;">{title}</div>
+        <div style="font-weight:bold; margin-bottom:8px; font-size:13px;">
+            {title}
+        </div>
         {items_html}
     </div>
     """
-    map_obj.get_root().add_child(FloatLegend(html))
+    map_obj.get_root().html.add_child(folium.Element(html))
 
 
 def add_indice_legend(map_obj):
@@ -392,67 +482,129 @@ def add_indice_legend(map_obj):
         position: fixed;
         bottom: 25px;
         left: 25px;
-        z-index: 9999;
-        background: rgba(255,255,255,0.95);
+        z-index: 999999;
+        background: rgba(255,255,255,0.96);
+        border: 1px solid #999;
         border-radius: 8px;
         padding: 10px;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-        max-width: 320px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.25);
+        max-width: 360px;
+        font-family: Arial, sans-serif;
+        max-height: 320px;
+        overflow-y: auto;
     ">
-        <div style="font-weight:bold; margin-bottom:8px; font-size:13px;">
+        <div style="font-weight:bold; margin-bottom:10px; font-size:13px;">
             Índice Multipeligro Climático (IMC)
         </div>
 
-        <div style="font-size:12px; margin-bottom:8px;">
-             <b>Muy Alto (0.75-1)</b>: Peligros climáticos extremos
-            (inundaciones, sequías, calor/frío severo)
+        <div style="font-size:12px; margin-bottom:10px; line-height:1.35;">
+            <span style="display:inline-block;width:12px;height:12px;background:#d7191c;border:1px solid #999;margin-right:6px;vertical-align:middle;"></span>
+            <b>Muy Alto (0.75 - 1.00):</b> alta concentración y coincidencia de peligros climáticos,
+            con mayor probabilidad de impactos severos en el territorio.
         </div>
 
-        <div style="font-size:12px; margin-bottom:8px;">
-             <b>Alto (0.5-0.75)</b>: Eventos climáticos intensos y frecuentes
-            (lluvias intensas, olas de calor/frío)
+        <div style="font-size:12px; margin-bottom:10px; line-height:1.35;">
+            <span style="display:inline-block;width:12px;height:12px;background:#f7941d;border:1px solid #999;margin-right:6px;vertical-align:middle;"></span>
+            <b>Alto (0.50 - 0.75):</b> presencia importante de peligros climáticos,
+            con potencial de generar impactos significativos.
         </div>
 
-        <div style="font-size:12px; margin-bottom:8px;">
-             <b>Medio (0.25-0.5)</b>: Variabilidad climática moderada
-            (episodios de lluvia o temperatura fuera de lo normal)
+        <div style="font-size:12px; margin-bottom:10px; line-height:1.35;">
+            <span style="display:inline-block;width:12px;height:12px;background:#f1dd00;border:1px solid #999;margin-right:6px;vertical-align:middle;"></span>
+            <b>Medio (0.25 - 0.50):</b> presencia moderada de peligros climáticos,
+            con impactos posibles según las condiciones del territorio.
         </div>
 
-        <div style="font-size:12px;">
-             <b>Bajo (0-0.25)</b>: Condiciones climáticas normales
-            o poco significativas
+        <div style="font-size:12px; line-height:1.35;">
+            <span style="display:inline-block;width:12px;height:12px;background:#9bc68b;border:1px solid #999;margin-right:6px;vertical-align:middle;"></span>
+            <b>Bajo (0.00 - 0.25):</b> menor presencia relativa de peligros climáticos
+            y menor probabilidad de impactos severos.
         </div>
     </div>
     """
-    map_obj.get_root().add_child(FloatLegend(html))
+    map_obj.get_root().html.add_child(folium.Element(html))
 
 
-def add_geojson_layer(map_obj, geojson_data, style_function, popup_function, layer_name):
-    fg = folium.FeatureGroup(name=layer_name, show=True)
+# =========================================================
+# CAPAS
+# =========================================================
+def add_climate_layer(map_obj, geojson_data, variable, layer_name):
+    district_field = get_district_field_name(geojson_data)
+    value_field = get_value_field_name(geojson_data)
 
-    for feature in geojson_data.get("features", []):
-        popup_html = popup_function(feature)
+    if district_field is None or value_field is None:
+        return
 
-        folium.GeoJson(
-            feature,
-            style_function=style_function,
-            highlight_function=lambda f: {
-                "weight": 1.2,
-                "color": "#222222",
-                "fillOpacity": 0.95
-            },
-            popup=folium.Popup(popup_html, max_width=300)
-        ).add_to(fg)
+    alias_val = "ΔP (%):" if variable == "pr" else "ΔT (°C):"
 
-    fg.add_to(map_obj)
+    folium.GeoJson(
+        geojson_data,
+        name=layer_name,
+        style_function=climate_style_function(variable),
+        highlight_function=lambda f: {
+            "weight": 1.0,
+            "color": "#111111",
+            "fillOpacity": 0.95
+        },
+        tooltip=folium.GeoJsonTooltip(
+            fields=[district_field, value_field],
+            aliases=["Distrito:", alias_val],
+            sticky=True,
+            labels=True,
+            localize=True
+        ),
+        popup=folium.GeoJsonPopup(
+            fields=[district_field, value_field],
+            aliases=["Distrito:", alias_val],
+            labels=True,
+            localize=True
+        ),
+    ).add_to(map_obj)
 
 
-def add_simple_layer(map_obj, geojson_data, name):
+def add_indice_layer(map_obj, geojson_data, layer_name):
+    district_field = get_district_field_name(geojson_data)
+    value_field = get_value_field_name(geojson_data)
+
+    if district_field is None or value_field is None:
+        return
+
+    folium.GeoJson(
+        geojson_data,
+        name=layer_name,
+        style_function=indice_style_function,
+        highlight_function=lambda f: {
+            "weight": 1.1,
+            "color": "#111111",
+            "fillOpacity": 0.92
+        },
+        tooltip=folium.GeoJsonTooltip(
+            fields=[district_field, value_field],
+            aliases=["Distrito:", "IMC:"],
+            sticky=True,
+            labels=True,
+            localize=True
+        ),
+        popup=folium.GeoJsonPopup(
+            fields=[district_field, value_field],
+            aliases=["Distrito:", "IMC:"],
+            labels=True,
+            localize=True
+        ),
+    ).add_to(map_obj)
+
+
+def add_reference_layer(map_obj, geojson_data, name):
     folium.GeoJson(
         geojson_data,
         name=name,
-        style_function=layer_style_function
+        style_function=layer_style_function,
+        control=True,
+        overlay=True,
+        show=True,
+        interactive=False
     ).add_to(map_obj)
+
 
 # =========================================================
 # INDEXES
@@ -475,11 +627,7 @@ if not periodos:
     st.error("No se encontraron archivos en la carpeta data.")
     st.stop()
 
-periodo = st.sidebar.selectbox(
-    "Periodo",
-    periodos,
-    index=0
-)
+periodo = st.sidebar.selectbox("Periodo", periodos, index=0)
 
 variable = st.sidebar.selectbox(
     "Variable",
@@ -510,51 +658,116 @@ if usar_indice == "Sí":
         index=0
     )
 
-st.sidebar.subheader("Capas")
+st.sidebar.subheader("Capas de referencia")
 show_departamentos = st.sidebar.checkbox("Departamentos", value=False)
 show_provincias = st.sidebar.checkbox("Provincias", value=False)
 show_cuencas = st.sidebar.checkbox("Cuencas", value=False)
+
+st.sidebar.subheader("Buscar ubicación por coordenadas")
+usar_busqueda = st.sidebar.checkbox("Ir a una coordenada", value=False)
+
+lat_input = None
+lon_input = None
+buscar_punto = False
+
+if usar_busqueda:
+    lat_input = st.sidebar.text_input("Latitud", value="-12.0464")
+    lon_input = st.sidebar.text_input("Longitud", value="-77.0428")
+    buscar_punto = st.sidebar.button("Buscar ubicación")
+
+# =========================================================
+# CARGA DE DATOS TEMÁTICOS
+# =========================================================
+climate_data = None
+indice_data = None
+
+climate_key = (variable, estacion, periodo)
+climate_path = climate_index.get(climate_key)
+if climate_path and os.path.exists(climate_path):
+    climate_data = load_geojson(climate_path)
+
+if usar_indice == "Sí":
+    indice_key = (tipo_indice, periodo)
+    indice_path = indice_index.get(indice_key)
+    if indice_path and os.path.exists(indice_path):
+        indice_data = load_geojson(indice_path)
+
+# =========================================================
+# MAPA: CENTRO DINÁMICO
+# =========================================================
+map_center = [-9, -75]
+map_zoom = 5
+search_marker = None
+search_popup_html = None
+
+if usar_busqueda and buscar_punto:
+    lat, lon, coord_error = parse_coordinates(lat_input, lon_input)
+
+    if coord_error:
+        st.sidebar.error(coord_error)
+    else:
+        map_center = [lat, lon]
+        map_zoom = 11
+        search_marker = [lat, lon]
+
+        climate_props = None
+        indice_props = None
+
+        if climate_data is not None:
+            climate_props = point_query_feature(climate_data, lat, lon)
+
+        if indice_data is not None:
+            indice_props = point_query_feature(indice_data, lat, lon)
+
+        search_popup_html = build_search_popup_html(
+            lat=lat,
+            lon=lon,
+            climate_props=climate_props,
+            variable=variable,
+            estacion=estacion,
+            periodo=periodo,
+            indice_props=indice_props,
+            tipo_indice=tipo_indice
+        )
 
 # =========================================================
 # MAPA
 # =========================================================
 m = folium.Map(
-    location=[-9, -75],
-    zoom_start=5,
+    location=map_center,
+    zoom_start=map_zoom,
     tiles="OpenStreetMap",
-    control_scale=True
+    control_scale=True,
+    prefer_canvas=True
 )
 
-# capa temática única
-if usar_indice == "Sí":
-    key = (tipo_indice, periodo)
-    path = indice_index.get(key)
+if search_marker is not None:
+    folium.Marker(
+        location=search_marker,
+        popup=folium.Popup(search_popup_html, max_width=380),
+        tooltip="Punto consultado",
+        icon=folium.Icon(color="red", icon="map-marker", prefix="fa")
+    ).add_to(m)
 
-    if path and os.path.exists(path):
-        data = load_geojson(path)
-        add_geojson_layer(
-            m,
-            data,
-            style_function=indice_style_function,
-            popup_function=indice_popup_html,
-            layer_name="Índice multipeligro"
-        )
+    folium.CircleMarker(
+        location=search_marker,
+        radius=7,
+        color="red",
+        fill=True,
+        fill_color="red",
+        fill_opacity=0.75
+    ).add_to(m)
+
+# capa temática principal + leyenda
+if usar_indice == "Sí":
+    if indice_data is not None:
+        add_indice_layer(m, indice_data, layer_name="Índice multipeligro")
         add_indice_legend(m)
     else:
         st.warning("No existe archivo de IMC para la combinación seleccionada.")
 else:
-    key = (variable, estacion, periodo)
-    path = climate_index.get(key)
-
-    if path and os.path.exists(path):
-        data = load_geojson(path)
-        add_geojson_layer(
-            m,
-            data,
-            style_function=climate_style_function(variable),
-            popup_function=lambda feature: climate_popup_html(feature, variable),
-            layer_name="Capa climática"
-        )
+    if climate_data is not None:
+        add_climate_layer(m, climate_data, variable=variable, layer_name="Capa climática")
         add_climate_legend(m, variable)
     else:
         st.warning("No existe archivo para la combinación seleccionada.")
@@ -562,15 +775,15 @@ else:
 # capas de referencia
 if show_departamentos and os.path.exists(LAYER_PATHS["departamentos"]):
     deptos = load_geojson(LAYER_PATHS["departamentos"])
-    add_simple_layer(m, deptos, "Departamentos")
+    add_reference_layer(m, deptos, "Departamentos")
 
 if show_provincias and os.path.exists(LAYER_PATHS["provincias"]):
     provs = load_geojson(LAYER_PATHS["provincias"])
-    add_simple_layer(m, provs, "Provincias")
+    add_reference_layer(m, provs, "Provincias")
 
 if show_cuencas and os.path.exists(LAYER_PATHS["cuencas"]):
     cuencas = load_geojson(LAYER_PATHS["cuencas"])
-    add_simple_layer(m, cuencas, "Cuencas")
+    add_reference_layer(m, cuencas, "Cuencas")
 
 folium.LayerControl(collapsed=False).add_to(m)
 
